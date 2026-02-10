@@ -493,6 +493,7 @@ async def treasury(interaction: discord.Interaction):
 
 @tree.command(guild=GUILD_OBJECT, name="lootsplit", description="Split silver among mentioned users with tax")
 @app_commands.describe(total="Total silver", tax="Tax percent", users="Mention users")
+@app_commands.checks.has_permissions(administrator=True)
 async def lootsplit(interaction: discord.Interaction, total: int, tax: int, users: str):
     """Split a total amount after tax and distribute evenly to users."""
     if interaction.guild is None:
