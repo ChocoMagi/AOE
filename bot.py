@@ -449,6 +449,18 @@ tree = app_commands.CommandTree(client)
 # BOT EVENTS
 # =========================================================
 
+@tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    if isinstance(error, app_commands.MissingPermissions):
+        return await send_error(
+            interaction,
+            "You need administrator privileges to use this command.",
+        )
+    raise error
+
 @client.event
 async def on_ready():
     db.init_schema()
