@@ -503,16 +503,39 @@ async def treasury(interaction: discord.Interaction):
         f"Guild treasury has **{format_silver(balance_amount)} silver**."
     )
 
-@tree.command(guild=GUILD_OBJECT, name="lootsplit", description="Split silver among mentioned users with tax")
-@app_commands.describe(total="Total silver", tax="Tax percent", users="Mention users")
+@tree.command(guild=GUILD_OBJECT, name="purge", description="Delete recent messages in this channel")
+@app_commands.describe(limit="Number of messages to delete (max 100)")
+@app_commands.checks.has_permissions(manage_messages=True)
+async def purge_messages(interaction: discord.Interaction, limit: int):
+    """Delete recent messages in the current channel (manage messages only)."""
+    if interaction.guild is None:
+        return await send_error(interaction, "This command can only be used in a server.")
+
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        return await send_error(interaction, "This command can only be used in a text channel.")
+
+    limit = clamp_limit(limit, 100)
+    await interaction.response.defer(ephemeral=True)
+    deleted = await channel.purge(limit=limit)
+    await interaction.followup.send(
+        f"Deleted **{len(deleted)}** messages in {channel.mention}.",
+        ephemeral=True,
+    )
+
+@tree.command(guild=GUILD_OBJECT, name="lootsplit", description="Split silver among mentioned users after repair fee and tax")
+@app_commands.describe(total="Total silver", repair="Flat repair fee", tax="Tax percent", users="Mention users")
 @app_commands.checks.has_permissions(administrator=True)
-async def lootsplit(interaction: discord.Interaction, total: int, tax: int, users: str):
-    """Split a total amount after tax and distribute evenly to users."""
+async def lootsplit(interaction: discord.Interaction, total: int, repair: int, tax: int, users: str):
+    """Split a total amount after a flat repair fee and tax, then distribute evenly."""
     if interaction.guild is None:
         return await send_error(interaction, "This command can only be used in a server.")
 
     if total <= 0:
         return await send_error(interaction, "Total must be positive.")
+
+    if repair < 0:
+        return await send_error(interaction, "Repair must be 0 or higher.")
 
     if not 0 <= tax <= 100:
         return await send_error(interaction, "Tax must be 0-100.")
@@ -568,8 +591,12 @@ async def lootsplit(interaction: discord.Interaction, total: int, tax: int, user
             "No valid users found. Make sure the users are in this server.",
         )
 
-    tax_amount = (total * tax) // 100
-    remaining = total - tax_amount
+    after_repair = total - repair
+    if after_repair <= 0:
+        return await send_error(interaction, "Repair fee is too high for this total.")
+
+    tax_amount = (after_repair * tax) // 100
+    remaining = after_repair - tax_amount
     share = remaining // len(recipients)
 
     if share <= 0:
@@ -597,6 +624,7 @@ async def lootsplit(interaction: discord.Interaction, total: int, tax: int, user
 
     await interaction.response.send_message(
         f"Total: **{format_silver(total)} silver**\n"
+        f"Repair: **{format_silver(repair)} silver**\n"
         f"Tax ({tax}%): **{format_silver(tax_amount)} silver**\n"
         f"Split: **{format_silver(remaining)} silver** among {', '.join(m.mention for m in recipients)}\n"
         f"Each received **{format_silver(share)} silver**.",
