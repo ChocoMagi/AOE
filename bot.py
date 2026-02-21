@@ -1,6 +1,7 @@
 import os
 import re
 import sqlite3
+import asyncio
 
 import discord
 from discord import app_commands
@@ -10,6 +11,10 @@ from discord import app_commands
 # =========================================================
 
 DB_PATH = "silver.db"
+BACKUP_XLSX_PATH = os.getenv("SILVER_BACKUP_XLSX", "backups/silver_backup_latest.xlsx")
+_OPENPYXL_MISSING_WARNED = False
+USER_ID_COLUMN_NAMES = {"user_id", "initiator_id", "sender_id", "receiver_id", "recipient_id"}
+GUILD_ID_COLUMN_NAMES = {"guild_id"}
 
 # =========================================================
 # ENV LOADING
@@ -87,6 +92,7 @@ class Database:
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     guild_id INTEGER NOT NULL,
                     initiator_id INTEGER NOT NULL,
+                    lootsplit_name TEXT,
                     total INTEGER NOT NULL,
                     tax_percent INTEGER NOT NULL,
                     tax_amount INTEGER NOT NULL,
@@ -97,6 +103,12 @@ class Database:
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
             """)
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(lootsplit_logs)").fetchall()
+            }
+            if "lootsplit_name" not in columns:
+                conn.execute("ALTER TABLE lootsplit_logs ADD COLUMN lootsplit_name TEXT")
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS lootsplit_recipients (
                     lootsplit_id INTEGER NOT NULL,
@@ -310,6 +322,7 @@ class Database:
         self,
         guild_id: int,
         initiator_id: int,
+        lootsplit_name: str | None,
         total: int,
         tax_percent: int,
         tax_amount: int,
@@ -323,6 +336,7 @@ class Database:
                 INSERT INTO lootsplit_logs (
                     guild_id,
                     initiator_id,
+                    lootsplit_name,
                     total,
                     tax_percent,
                     tax_amount,
@@ -330,10 +344,11 @@ class Database:
                     share,
                     recipient_count,
                     recipient_ids
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """, (
                 guild_id,
                 initiator_id,
+                lootsplit_name,
                 total,
                 tax_percent,
                 tax_amount,
@@ -362,6 +377,7 @@ class Database:
             return conn.execute("""
                 SELECT
                     l.initiator_id,
+                    l.lootsplit_name,
                     l.total,
                     l.tax_percent,
                     l.share,
@@ -434,6 +450,307 @@ async def send_error(interaction: discord.Interaction, message: str):
 
 def format_silver(amount: int) -> str:
     return f"{amount:,}"
+
+
+def _build_lootsplit_lines(
+    total: int,
+    repair: int,
+    tax: int,
+    tax_amount: int,
+    remaining: int,
+    share: int,
+    recipients: list[discord.Member],
+    lootsplit_name: str | None,
+) -> list[str]:
+    lines: list[str] = []
+    if lootsplit_name:
+        lines.append(f"Lootsplit name: **{lootsplit_name}**")
+    lines.extend(
+        [
+            f"Total: **{format_silver(total)} silver**",
+            f"Repair: **{format_silver(repair)} silver**",
+            f"Tax ({tax}%): **{format_silver(tax_amount)} silver**",
+            f"Split: **{format_silver(remaining)} silver** among {', '.join(m.mention for m in recipients)}",
+            f"Each receives **{format_silver(share)} silver**.",
+        ]
+    )
+    return lines
+
+
+class LootsplitConfirmView(discord.ui.View):
+    def __init__(
+        self,
+        guild_id: int,
+        guild: discord.Guild | None,
+        initiator_id: int,
+        lootsplit_name: str | None,
+        total: int,
+        repair: int,
+        tax: int,
+        tax_amount: int,
+        remaining: int,
+        share: int,
+        recipients: list[discord.Member],
+    ):
+        super().__init__(timeout=120)
+        self.guild_id = guild_id
+        self.guild = guild
+        self.initiator_id = initiator_id
+        self.lootsplit_name = lootsplit_name
+        self.total = total
+        self.repair = repair
+        self.tax = tax
+        self.tax_amount = tax_amount
+        self.remaining = remaining
+        self.share = share
+        self.recipients = recipients
+        self.applied = False
+
+    def _summary(self) -> str:
+        return "\n".join(
+            _build_lootsplit_lines(
+                total=self.total,
+                repair=self.repair,
+                tax=self.tax,
+                tax_amount=self.tax_amount,
+                remaining=self.remaining,
+                share=self.share,
+                recipients=self.recipients,
+                lootsplit_name=self.lootsplit_name,
+            )
+        )
+
+    async def _reject_non_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.initiator_id:
+            return False
+        await interaction.response.send_message(
+            "Only the command initiator can confirm or cancel this lootsplit.",
+            ephemeral=True,
+        )
+        return True
+
+    def _disable_all_buttons(self):
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.success)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if await self._reject_non_owner(interaction):
+            return
+        if self.applied:
+            await interaction.response.send_message("This lootsplit was already confirmed.", ephemeral=True)
+            return
+
+        recipient_ids = ",".join(str(member.id) for member in self.recipients)
+        for member in self.recipients:
+            db.ensure_account(self.guild_id, member.id)
+            db.add_balance(self.guild_id, member.id, self.share)
+
+        if self.tax_amount > 0:
+            db.add_treasury(self.guild_id, self.tax_amount)
+
+        db.log_lootsplit(
+            self.guild_id,
+            self.initiator_id,
+            self.lootsplit_name,
+            self.total,
+            self.tax,
+            self.tax_amount,
+            self.remaining,
+            self.share,
+            len(self.recipients),
+            recipient_ids,
+        )
+        await run_excel_backup(self.guild)
+
+        self.applied = True
+        self._disable_all_buttons()
+        await interaction.response.edit_message(
+            content="Lootsplit confirmed and applied.\n" + self._summary(),
+            view=self,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.danger)
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button):
+        if await self._reject_non_owner(interaction):
+            return
+        if self.applied:
+            await interaction.response.send_message("This lootsplit was already confirmed.", ephemeral=True)
+            return
+
+        self._disable_all_buttons()
+        await interaction.response.edit_message(
+            content="Lootsplit canceled. No balances were changed.",
+            view=self,
+        )
+
+
+def _quote_identifier(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _format_user_id(value: object, user_name_map: dict[int, str]) -> object:
+    if not isinstance(value, int):
+        return value
+    name = user_name_map.get(value)
+    if not name:
+        return value
+    return f"{name} ({value})"
+
+
+def _format_recipient_ids(value: object, user_name_map: dict[int, str]) -> object:
+    if not isinstance(value, str):
+        return value
+    parts = [p.strip() for p in value.split(",") if p.strip()]
+    if not parts:
+        return value
+
+    formatted: list[str] = []
+    for part in parts:
+        if not part.isdigit():
+            formatted.append(part)
+            continue
+        uid = int(part)
+        name = user_name_map.get(uid)
+        formatted.append(f"{name} ({uid})" if name else part)
+    return ", ".join(formatted)
+
+
+def _collect_user_ids_for_backup(db_path: str = DB_PATH) -> set[int]:
+    user_ids: set[int] = set()
+    try:
+        with sqlite3.connect(db_path) as conn:
+            queries = [
+                ("SELECT user_id FROM accounts", False),
+                ("SELECT initiator_id, recipient_ids FROM lootsplit_logs", True),
+                ("SELECT recipient_id FROM lootsplit_recipients", False),
+                ("SELECT sender_id, receiver_id FROM transfer_logs", False),
+                ("SELECT initiator_id, recipient_id FROM treasury_logs", False),
+            ]
+            for query, has_recipient_ids in queries:
+                for row in conn.execute(query).fetchall():
+                    for value in row:
+                        if isinstance(value, int):
+                            user_ids.add(value)
+                    if has_recipient_ids and len(row) > 1 and isinstance(row[1], str):
+                        for part in row[1].split(","):
+                            part = part.strip()
+                            if part.isdigit():
+                                user_ids.add(int(part))
+    except Exception:
+        return set()
+    return user_ids
+
+
+def export_database_to_excel(
+    db_path: str = DB_PATH,
+    output_path: str = BACKUP_XLSX_PATH,
+    user_name_map: dict[int, str] | None = None,
+    guild_name_map: dict[int, str] | None = None,
+) -> tuple[bool, str]:
+    user_name_map = user_name_map or {}
+    guild_name_map = guild_name_map or {}
+    try:
+        from openpyxl import Workbook
+    except ModuleNotFoundError:
+        return False, "openpyxl is not installed"
+
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        with sqlite3.connect(db_path) as conn:
+            table_rows = conn.execute("""
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table'
+                  AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+            """).fetchall()
+
+            table_names = [row[0] for row in table_rows]
+
+            workbook = Workbook()
+            default_sheet = workbook.active
+            workbook.remove(default_sheet)
+
+            if not table_names:
+                sheet = workbook.create_sheet("empty")
+                sheet.append(["message"])
+                sheet.append(["No tables found in database"])
+            else:
+                for table_name in table_names:
+                    query_table = _quote_identifier(table_name)
+                    sheet_name = table_name[:31] or "sheet"
+                    sheet = workbook.create_sheet(sheet_name)
+
+                    header_cursor = conn.execute(f"SELECT * FROM {query_table} LIMIT 0")
+                    headers = [col[0] for col in (header_cursor.description or [])]
+                    if headers:
+                        sheet.append(headers)
+
+                    row_cursor = conn.execute(f"SELECT * FROM {query_table}")
+                    for row in row_cursor.fetchall():
+                        out_row = []
+                        for index, value in enumerate(row):
+                            column = headers[index] if index < len(headers) else ""
+                            if column in USER_ID_COLUMN_NAMES:
+                                out_row.append(_format_user_id(value, user_name_map))
+                            elif column == "recipient_ids":
+                                out_row.append(_format_recipient_ids(value, user_name_map))
+                            elif column in GUILD_ID_COLUMN_NAMES and isinstance(value, int):
+                                guild_name = guild_name_map.get(value)
+                                out_row.append(f"{guild_name} ({value})" if guild_name else value)
+                            else:
+                                out_row.append(value)
+                        sheet.append(out_row)
+
+            workbook.save(output_path)
+    except Exception as exc:
+        return False, str(exc)
+
+    return True, output_path
+
+
+async def run_excel_backup(guild: discord.Guild | None = None) -> None:
+    global _OPENPYXL_MISSING_WARNED
+
+    user_name_map: dict[int, str] = {}
+    guild_name_map: dict[int, str] = {}
+
+    if guild is not None:
+        guild_name_map[guild.id] = guild.name
+        user_ids = await asyncio.to_thread(_collect_user_ids_for_backup)
+        for user_id in user_ids:
+            member = guild.get_member(user_id)
+            if member is None:
+                try:
+                    member = await guild.fetch_member(user_id)
+                except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                    member = None
+            if member is not None:
+                user_name_map[user_id] = str(member)
+
+    success, detail = await asyncio.to_thread(
+        export_database_to_excel,
+        DB_PATH,
+        BACKUP_XLSX_PATH,
+        user_name_map,
+        guild_name_map,
+    )
+    if success:
+        return
+
+    if detail == "openpyxl is not installed":
+        if not _OPENPYXL_MISSING_WARNED:
+            print("Excel backup disabled: install openpyxl (`pip install openpyxl`).")
+            _OPENPYXL_MISSING_WARNED = True
+        return
+
+    print(f"Excel backup failed: {detail}")
 
 
 
@@ -524,9 +841,22 @@ async def purge_messages(interaction: discord.Interaction, limit: int):
     )
 
 @tree.command(guild=GUILD_OBJECT, name="lootsplit", description="Split silver among mentioned users after repair fee and tax")
-@app_commands.describe(total="Total silver", repair="Flat repair fee", tax="Tax percent", users="Mention users")
+@app_commands.describe(
+    total="Total silver",
+    repair="Flat repair fee",
+    tax="Tax percent",
+    users="Mention users",
+    name="Optional name for this lootsplit",
+)
 @app_commands.checks.has_permissions(administrator=True)
-async def lootsplit(interaction: discord.Interaction, total: int, repair: int, tax: int, users: str):
+async def lootsplit(
+    interaction: discord.Interaction,
+    total: int,
+    repair: int,
+    tax: int,
+    users: str,
+    name: str | None = None,
+):
     """Split a total amount after a flat repair fee and tax, then distribute evenly."""
     if interaction.guild is None:
         return await send_error(interaction, "This command can only be used in a server.")
@@ -539,6 +869,10 @@ async def lootsplit(interaction: discord.Interaction, total: int, repair: int, t
 
     if not 0 <= tax <= 100:
         return await send_error(interaction, "Tax must be 0-100.")
+
+    lootsplit_name = (name or "").strip() or None
+    if lootsplit_name and len(lootsplit_name) > 80:
+        return await send_error(interaction, "Lootsplit name must be 80 characters or fewer.")
 
     user_ids = set(int(uid) for uid in re.findall(r"<@!?(\d+)>", users))
     if not user_ids:
@@ -602,32 +936,33 @@ async def lootsplit(interaction: discord.Interaction, total: int, repair: int, t
     if share <= 0:
         return await send_error(interaction, "Not enough silver to split.")
 
-    recipient_ids = ",".join(str(member.id) for member in recipients)
-    for member in recipients:
-        db.ensure_account(interaction.guild.id, member.id)
-        db.add_balance(interaction.guild.id, member.id, share)
-
-    if tax_amount > 0:
-        db.add_treasury(interaction.guild.id, tax_amount)
-
-    db.log_lootsplit(
+    preview_lines = _build_lootsplit_lines(
+        total=total,
+        repair=repair,
+        tax=tax,
+        tax_amount=tax_amount,
+        remaining=remaining,
+        share=share,
+        recipients=recipients,
+        lootsplit_name=lootsplit_name,
+    )
+    preview_lines.append("Press **Confirm** to apply this lootsplit, or **Cancel** to abort.")
+    view = LootsplitConfirmView(
         interaction.guild.id,
+        interaction.guild,
         interaction.user.id,
+        lootsplit_name,
         total,
+        repair,
         tax,
         tax_amount,
         remaining,
         share,
-        len(recipients),
-        recipient_ids,
+        recipients,
     )
-
     await interaction.response.send_message(
-        f"Total: **{format_silver(total)} silver**\n"
-        f"Repair: **{format_silver(repair)} silver**\n"
-        f"Tax ({tax}%): **{format_silver(tax_amount)} silver**\n"
-        f"Split: **{format_silver(remaining)} silver** among {', '.join(m.mention for m in recipients)}\n"
-        f"Each received **{format_silver(share)} silver**.",
+        "\n".join(preview_lines),
+        view=view,
         allowed_mentions=discord.AllowedMentions.none(),
     )
 
@@ -641,6 +976,7 @@ async def give_silver(interaction: discord.Interaction, member: discord.Member, 
 
     db.ensure_account(interaction.guild.id, member.id)
     db.add_balance(interaction.guild.id, member.id, amount)
+    await run_excel_backup(interaction.guild)
 
     await interaction.response.send_message(
         f"Added **{format_silver(amount)} silver** to {member.mention}."
@@ -656,6 +992,7 @@ async def treasury_add(interaction: discord.Interaction, amount: int):
 
     db.add_treasury(interaction.guild.id, amount)
     db.log_treasury(interaction.guild.id, interaction.user.id, "add", amount)
+    await run_excel_backup(interaction.guild)
     await interaction.response.send_message(
         f"Added **{format_silver(amount)} silver** to the treasury."
     )
@@ -670,6 +1007,7 @@ async def take_silver(interaction: discord.Interaction, member: discord.Member, 
 
     if not db.deduct_balance(interaction.guild.id, member.id, amount):
         return await send_error(interaction, "Insufficient balance; no silver was removed.")
+    await run_excel_backup(interaction.guild)
 
     await interaction.response.send_message(
         f"Removed **{format_silver(amount)} silver** from {member.mention}."
@@ -692,6 +1030,7 @@ async def treasury_take(
         if not success:
             return await send_error(interaction, "Treasury has insufficient funds.")
         db.log_treasury(interaction.guild.id, interaction.user.id, "transfer", amount, member.id)
+        await run_excel_backup(interaction.guild)
         await interaction.response.send_message(
             f"Transferred **{format_silver(amount)} silver** from the treasury to {member.mention}."
         )
@@ -701,6 +1040,7 @@ async def treasury_take(
         return await send_error(interaction, "Treasury has insufficient funds.")
 
     db.log_treasury(interaction.guild.id, interaction.user.id, "take", amount)
+    await run_excel_backup(interaction.guild)
     await interaction.response.send_message(
         f"Removed **{format_silver(amount)} silver** from the treasury."
     )
@@ -719,6 +1059,7 @@ async def transfer(interaction: discord.Interaction, member: discord.Member, amo
         return await send_error(interaction, "Not enough silver.")
 
     db.log_transfer(interaction.guild.id, interaction.user.id, member.id, amount)
+    await run_excel_backup(interaction.guild)
 
     await interaction.response.send_message(
         f"{interaction.user.mention} sent **{format_silver(amount)} silver** to {member.mention}."
@@ -738,10 +1079,11 @@ async def lootsplit_history(interaction: discord.Interaction, limit: int = 5, pa
         return await interaction.response.send_message("No lootsplit history yet.")
 
     lines = [f"Recent lootsplits (page {page}):"]
-    for initiator_id, total, tax_percent, share, recipient_ids, created_at in rows:
+    for initiator_id, lootsplit_name, total, tax_percent, share, recipient_ids, created_at in rows:
         recipients = ", ".join(f"<@{uid}>" for uid in recipient_ids.split(",") if uid)
+        name_prefix = f"[{lootsplit_name}] " if lootsplit_name else ""
         lines.append(
-            f"{created_at} - <@{initiator_id}> split {format_silver(total)} silver "
+            f"{created_at} - <@{initiator_id}> {name_prefix}split {format_silver(total)} silver "
             f"(tax {tax_percent}%), {recipients}, {format_silver(share)} each"
         )
 
